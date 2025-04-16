@@ -1,5 +1,5 @@
 
-# 📡 Cloud-Edge Collaborative Inference with LLaMA Accessory
+# 📡 Cloud-Device Collaborative Learning for Multimodal Large Language Models
 
 This repository provides a complete tutorial and implementation for **cloud-edge collaborative large model inference**, based on [LLaMA-Accessory](https://github.com/Alpha-VLLM/LLaMA2-Accessory), with support for token-level uncertainty-driven transmission and  knowledge update between edge (7B) and cloud (13B) models.
 
@@ -9,7 +9,7 @@ This repository provides a complete tutorial and implementation for **cloud-edge
 
 Follow the LLaMA-Accessory instructions to configure your environment:
 
-Make sure your environment supports both the LLaMA 7B and 13B models. You can also refer to this repo for ways to extend multimodal large models to other base LLMs.
+Make sure your environment supports both the LLaMA 7B and 13B models. You can also refer to this repo for ways to extend multimodal large language model to other base LLMs.
 
 Additionally, make sure to install the following dependencies for AKD on the cloud side:
 
