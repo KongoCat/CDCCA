@@ -1,0 +1,5 @@
+META:
+  -
+    path: '/home/cx/datasets/cdv3/tpami_json/common/vqav2_train.json'
+    type: 'image_text'
+    preprocess: "single_turn_llava"
