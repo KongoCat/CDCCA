@@ -382,15 +382,15 @@ class Transformer(nn.Module):
             #-------UTS------------------------------------------------------
             image_tokens = self.encode_image(image).last_hidden_state
             mask = self.mc_dropout_and_mask(image_tokens)
-            image_tokens = image_tokens * mask
-            image_tokens = self.qformer_proj(image_tokens)
+            image_tokens_mask = image_tokens * mask
+            image_tokens = self.qformer_proj(image_tokens_mask)
             #----------------------------------------------------------------
             self.cache_image_words = image_tokens.shape[1] + 1 + 1
             h = torch.cat((h_bos, self.start_img.repeat(_bsz, 1, 1), image_tokens, self.end_img.repeat(_bsz, 1, 1), h_caption), dim=1)
             seqlen = h.shape[1]
             freqs_cis = self.freqs_cis[0: seqlen]
         else:
-            image_tokens = None
+            image_tokens_mask = None
             if start_pos == 0:
                 self.cache_image_words = 0
                 freqs_cis = self.freqs_cis[0: seqlen]
@@ -408,7 +408,7 @@ class Transformer(nn.Module):
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h[:, -1, :])  # only compute last logits
-        return output.float(), image_tokens
+        return output.float(), image_tokens_mask
 
     def _allocate_kv_cache(self, max_batch_size: int) -> None:
         for layer in self.layers:

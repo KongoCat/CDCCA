@@ -134,6 +134,7 @@ print(l)
 for i in tqdm(data[:l//20]):
     img_path = i["image"] #'/data/lcx/someResource/man.jpeg'
     question = i["conversations"][0]["value"] #'What is in the photo?'
+    print(img_path)
     ans, probs, image_tokens = generate(img_path, question, "","alpaca",128,0.1,.75)
     # print(ans, probs) #debug
     conf_stack = torch.stack(probs)

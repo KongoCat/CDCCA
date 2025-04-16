@@ -33,7 +33,9 @@ import copy
 from .distill_loss import FKD, SKD, QueryKD
 from . import llama_qformerv2_peft
 from .. import LLM
-from util.tensor_parallel import load_tensor_parallel_model
+from util.tensor_parallel import load_tensor_parallel_model_list
+from util.tensor_type import default_tensor_type
+from model.meta import MetaModel
 
 
 @dataclass
@@ -48,7 +50,7 @@ class ModelArgs:
     norm_eps: float = 1e-5
     rope_theta: float = 10000
 
-    max_batch_size: int = 1
+    max_batch_size: int = 8
     max_seq_len: int = 512
 
     rope_scaling: Optional[float] = None
@@ -264,75 +266,20 @@ class TransformerBlock(nn.Module):
         out = self._forward_ffn(h)
         return out
 
-# def load_sharded_model(model, path, map_location='cpu'):
-#     full_state_dict = {}
-
-#     basename = os.path.basename(path)
-#     folder = os.path.dirname(path)
-
-#     match = re.match(r"consolidated\.00-of-(\d+)\.model\.pth", basename)
-#     if match:
-#         shard_count = int(match.group(1))
-
-#         if shard_count == 1:
-#             # 只有一个分片
-#             print(f"[Loader] Single consolidated file detected: {basename}")
-#             shard = torch.load(path, map_location=map_location)
-#             shard_state_dict = shard['model'] if 'model' in shard else shard
-
-#             for key, value in shard_state_dict.items():
-#                 key = key[len("llma."):] if key.startswith("llma.") else key
-#                 full_state_dict[key] = value
-
-#         else:
-#             # 多分片情况
-#             shard_files = sorted([
-#                 os.path.join(folder, f)
-#                 for f in os.listdir(folder)
-#                 if f.startswith("consolidated") and f.endswith(".pth")
-#             ])
-#             print(f"[Loader] Found {len(shard_files)} shards")
-#             for shard_path in shard_files:
-#                 print(f"[Loader] Loading shard: {shard_path}")
-#                 shard = torch.load(shard_path, map_location=map_location)
-#                 shard_state_dict = shard['model'] if 'model' in shard else shard
-
-#                 for key, value in shard_state_dict.items():
-#                     key = key[len("llma."):] if key.startswith("llma.") else key
-#                     full_state_dict[key] = value
-
+# def load_model(model_without_ddp, path):
+#     if path.startswith('https'):
+#         checkpoint = torch.hub.load_state_dict_from_url(
+#             path, map_location='cpu', check_hash=True)
 #     else:
-#         # 普通 .pth 文件
-#         print(f"[Loader] Loading standard model file: {path}")
-#         checkpoint = torch.load(path, map_location=map_location)
-#         state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+#         checkpoint = torch.load(path, map_location='cpu')
+#     new_checkpoint = {}
+#     for key, value in checkpoint['model'].items():
+#         # # key = key.replace("llma", "llama")
+#         key =  key.removeprefix("llma.")
+#         new_checkpoint[key] = value
 
-#         for key, value in state_dict.items():
-#             key = key[len("llma."):] if key.startswith("llma.") else key
-#             full_state_dict[key] = value
-
-#     # 加载进模型
-#     missing_keys, unexpected_keys = model.load_state_dict(full_state_dict, strict=False)
-
-#     print("\n Model Loaded")
-#     print(f" - Missing keys ({len(missing_keys)}): {missing_keys[:5]}")
-#     print(f" - Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:5]}")
-#     return model
-
-def load_model(model_without_ddp, path):
-    if path.startswith('https'):
-        checkpoint = torch.hub.load_state_dict_from_url(
-            path, map_location='cpu', check_hash=True)
-    else:
-        checkpoint = torch.load(path, map_location='cpu')
-    new_checkpoint = {}
-    for key, value in checkpoint['model'].items():
-        # # key = key.replace("llma", "llama")
-        key =  key.removeprefix("llma.")
-        new_checkpoint[key] = value
-
-    print(model_without_ddp.load_state_dict(new_checkpoint, strict=False))
-    print("Load checkpoint %s" % path)
+#     print(model_without_ddp.load_state_dict(new_checkpoint, strict=False))
+#     print("Load checkpoint %s" % path)
 
 class Transformer(nn.Module):
     is_peft = True
@@ -363,72 +310,57 @@ class Transformer(nn.Module):
         self.cache_image_words = 0 # for inference
         
         #--------------------------------Query KD------------------------------------------------------------------------------------------
-        self.QueryKD = QueryKD(stu_channel=768, tea_channel=768)
-        self.QueryKD_feature_proj = QueryKD(stu_channel=4096, tea_channel=4096) #7B 4096 13B 5120
+        self.QueryKD = QueryKD(stu_channel=4096, tea_channel=5120)
+        self.QueryKD_feature_proj = QueryKD(stu_channel=4096, tea_channel=5120) #7B 4096 13B 5120
         #--------------------------------------------------------
         # 在 __init__ 中设置教师模型路径等参数
-        self.teacher_ckpt_path = "/home/cx/ckpts/llama2_acc/alpacaLlava_llamaQformerv2/consolidated.00-of-01.model.pth"
+        self.teacher_base = "/home/cx/ckpts/llama2_acc/alpacaLlava_llamaQformerv2Peft_13b"
+        self.teacher_lora = "/home/cx/llama2_accessory/LLaMA2-Accessory-main/output/common/llama2_qformer_13B_aokvqa/epoch2"
         self.teacher_tokenizer_path = "/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/tokenizer.model"
-        self.teacher_config_path = "/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/7B_params.json"
-        self._teacher_model = None
-        self._teacher_tokenizer = None
-        self._teacher_freqs_cis = None
+        self.teacher_config_path = "/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/13B_params.json"
+        self.teacher_llama_type = "llama_qformerv2_peft"
         #------------------------------------------------------------
         
         
         if with_visual:
             print("build llama model with qformerv2")
-            # self.qformer = Blip2Model.from_pretrained("/home/cx/ckpts/blip2-opt-2.7b", torch_dtype=torch.float16).cpu()  #("Salesforce/blip2-opt-2.7b", torch_dtype=torch.float16)
+            # self.qformer = Blip2Model.from_pretrained("/home/cx/ckpts/blip2-opt-2.7b", torch_dtype=torch.float16) #("Salesforce/blip2-opt-2.7b", torch_dtype=torch.float16)
 
             # self.qformer.language_projection = None
             # self.qformer.language_model = None
 
-            # self.qformer_proj = nn.Sequential(
-            #     nn.Linear(768, params.dim),
-            #     nn.LayerNorm(params.dim)
-            # )
+            self.qformer_proj = nn.Sequential(
+                nn.Linear(768, params.dim),
+                nn.LayerNorm(params.dim)
+            )
             self.image_words = 32
             # add image tags
             self.start_img = nn.Parameter(torch.rand(1, 1, params.dim))
             self.end_img = nn.Parameter(torch.rand(1, 1, params.dim))
 
     def get_teacher_model(self, device="cpu"):
-        if self._teacher_model is None:
-            print("[TeacherLoader] Initializing teacher model...")
+        if getattr(self, "_teacher_model_loaded", False):
+            return self.teacher_model, self.teacher_freqs_cis
+        
+        with default_tensor_type(dtype=torch.bfloat16, device=device):
+            self.teacher_model = MetaModel(self.teacher_llama_type, [self.teacher_config_path], self.teacher_tokenizer_path, with_visual=True)
 
-            # 1. 加载配置和参数类
-            ModelArgs = LLM.__dict__["llama_qformerv2_peft"].ModelArgs
-            Transformer = LLM.__dict__["llama_qformerv2_peft"].Transformer
+        print("[TeacherLoader] Loading checkpoint from:", self.teacher_lora)
+        load_tensor_parallel_model_list(self.teacher_model, [self.teacher_base])
+        load_tensor_parallel_model_list(self.teacher_model, [self.teacher_lora])
+        print("[TeacherLoader] Teacher model loaded.")
 
-            with open(self.teacher_config_path, "r") as f:
-                teacher_params = json.load(f)
+        self.teacher_freqs_cis = precompute_freqs_cis(
+            self.teacher_model.llma.params.dim // self.teacher_model.llma.params.n_heads,
+            self.teacher_model.llma.params.max_seq_len * 2,
+            theta=self.teacher_model.llma.params.rope_theta,
+            scaling=self.teacher_model.llma.params.rope_scaling
+        )
 
-            teacher_args = ModelArgs(
-                max_seq_len=512,
-                max_batch_size=1,
-                **teacher_params
-            )
+        self._teacher_model_loaded = True
+        return self.teacher_model.llma, self.teacher_freqs_cis
 
-            # 2. 初始化 tokenizer
-            
-            self._teacher_tokenizer = Tokenizer(model_path=self.teacher_tokenizer_path)
-            teacher_args.vocab_size = self._teacher_tokenizer.n_words
 
-            # 3. 创建模型（初始在 CPU 上）
-            self._teacher_model = Transformer(teacher_args, with_visual=True).to("cpu")
-
-            # 4. 加载权重
-            print("[TeacherLoader] Loading checkpoint from:", self.teacher_ckpt_path)
-            # self._teacher_model = load_sharded_model(self._teacher_model, self.teacher_ckpt_path, map_location="cpu")
-            load_model(self._teacher_model, self.teacher_ckpt_path)
-
-            # 5. 预提取 freqs_cis
-            self._teacher_freqs_cis = self._teacher_model.freqs_cis
-
-            print("[TeacherLoader] Teacher model loaded.")
-
-        # 返回 .to(device) 的模型
-        return self._teacher_model.to(device)
 
 
     def get_trainable_params(self):
@@ -445,7 +377,7 @@ class Transformer(nn.Module):
                 if any([_ in name for _ in trainable_key_words]):
                     trainable[name] = para
             else:
-                trainable_key_words = ['query_token']
+                trainable_key_words = ['qformer_proj']
                 if any([_ in name for _ in trainable_key_words]):
                     trainable[name] = para
 
@@ -464,29 +396,32 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(examples)
         self.freqs_cis = self.freqs_cis.to(h.device)
         
-        self.teacher_model = self.get_teacher_model(device="cuda")
-        h_teacher = self.teacher_model.tok_embeddings(examples)
-        self.teacher_freqs_cis = self._teacher_freqs_cis.to(h.device)
+        with torch.no_grad():
+            self.teacher_model, self.teacher_freqs_cis = self.get_teacher_model(device="cuda")  # or "cpu" if you want lazy .to(device)
+            h_teacher = self.teacher_model.tok_embeddings(examples)
+            self.teacher_freqs_cis = self.teacher_freqs_cis.to(h_teacher.device)
 
         image_words = 0
         if image is not None:
             h_bos, h_caption = h[:, :1], h[:, 1:]
             h_teacher_bos,h_teacher_caption = h_teacher[:, :1],h_teacher[:, 1:]
-            image_tokens = image
-            image_teacher_tokens = copy.deepcopy(image)
+            image_tokens = self.qformer_proj(image)
             h = torch.cat((h_bos, self.start_img.expand(_bsz, -1, -1), image_tokens, self.end_img.expand(_bsz, -1, -1), h_caption), dim=1)
-            h_teacher = torch.cat((h_teacher_bos, self.teacher_model.start_img.expand(_bsz, -1, -1), image_teacher_tokens, self.teacher_model.end_img.expand(_bsz, -1, -1), h_teacher_caption), dim=1)
+            with torch.no_grad():
+                image_teacher_tokens = self.teacher_model.qformer_proj(copy.deepcopy(image))
+                h_teacher = torch.cat((h_teacher_bos, self.teacher_model.start_img.expand(_bsz, -1, -1), image_teacher_tokens, self.teacher_model.end_img.expand(_bsz, -1, -1), h_teacher_caption), dim=1)
             image_words = image_tokens.shape[1] + 1 + 1
             seqlen = h.shape[1]
             seqlen_teacher = h_teacher.shape[1]
+            
+            
         freqs_cis = self.freqs_cis[:seqlen]
         teacher_freqs_cis = self.teacher_freqs_cis[:seqlen_teacher]
         #-------------------------------------------------------
         idx = 0
         for layer in self.layers:
             idx+=1
-            h = layer(h, start_pos=0, freqs_cis=freqs_cis, mask="causal")
-            
+            h = layer(h, start_pos=0, freqs_cis=freqs_cis, mask="causal")         
         #-------------------------------------------------------
         with torch.no_grad():
             idx = 0
@@ -500,11 +435,12 @@ class Transformer(nn.Module):
         output = self.output(h[:, image_words:, :])
         
         #----------calculate_KD loss----------------------------------------
-        # f_s = self.qformer.query_tokens #get student token
-        # f_t = self.teacher_model.qformer.query_tokens
-        # KD_loss = self.QueryKD(f_s,f_t)
+        f_s = image_tokens #get student token
+        f_t = image_teacher_tokens
         
-        return output, KD_feature_loss, KD_feature_loss
+        KD_token_loss = self.QueryKD(f_s,f_t)
+        
+        return output, KD_token_loss, KD_feature_loss
 
 
     @torch.inference_mode()
@@ -518,7 +454,7 @@ class Transformer(nn.Module):
         if uts_tokens is not None:
             assert start_pos == 0
             h_bos, h_caption = h[:, :1], h[:, 1:]
-            image_tokens = uts_tokens #load UTS tokens
+            image_tokens = self.qformer_proj(uts_tokens) #load UTS tokens
             self.cache_image_words = image_tokens.shape[1] + 1 + 1
             h = torch.cat((h_bos, self.start_img.repeat(_bsz, 1, 1), image_tokens, self.end_img.repeat(_bsz, 1, 1), h_caption), dim=1)
             seqlen = h.shape[1]

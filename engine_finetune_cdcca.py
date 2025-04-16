@@ -76,6 +76,8 @@ def train_one_epoch(model: torch.nn.Module,
         torch.cuda.synchronize()
 
         metric_logger.update(closs=c_loss_value)
+        metric_logger.update(KD_query_loss=KD_loss_value)
+        metric_logger.update(KD_feature_loss=KD_feature_loss_value)
 
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
@@ -94,7 +96,8 @@ def train_one_epoch(model: torch.nn.Module,
             """
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('c_train_loss', c_loss_value_reduce, epoch_1000x)
-            log_writer.add_scalar('KD_train_loss', KD_loss_value_reduce, epoch_1000x)
+            log_writer.add_scalar('KD_token_loss', KD_loss_value_reduce, epoch_1000x)
+            log_writer.add_scalar('KD_feature_loss', KD_feature_loss_value_reduce, epoch_1000x)
             if update_grad:
                 log_writer.add_scalar('grad_norm', grad_norm_reduce, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)

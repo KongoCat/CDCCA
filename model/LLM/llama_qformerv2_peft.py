@@ -42,7 +42,7 @@ class ModelArgs:
     norm_eps: float = 1e-5
     rope_theta: float = 10000
 
-    max_batch_size: int = 1
+    max_batch_size: int = 8
     max_seq_len: int = 512 #2048
 
     rope_scaling: Optional[float] = None
@@ -287,11 +287,11 @@ class Transformer(nn.Module):
         self.image_words = 0
         self.cache_image_words = 0 # for inference
         if with_visual:
-            print("build llama model with qformerv2")
-            self.qformer = Blip2Model.from_pretrained("/home/cx/ckpts/blip2-opt-2.7b", torch_dtype=torch.float16)   # fix cpu ("Salesforce/blip2-opt-2.7b", torch_dtype=torch.float16)
+            # print("build llama model with qformerv2")
+            # self.qformer = Blip2Model.from_pretrained("/home/cx/ckpts/blip2-opt-2.7b", torch_dtype=torch.float16)   # fix cpu ("Salesforce/blip2-opt-2.7b", torch_dtype=torch.float16)
 
-            self.qformer.language_projection = None
-            self.qformer.language_model = None
+            # self.qformer.language_projection = None
+            # self.qformer.language_model = None
 
             self.qformer_proj = nn.Sequential(
                 nn.Linear(768, params.dim),

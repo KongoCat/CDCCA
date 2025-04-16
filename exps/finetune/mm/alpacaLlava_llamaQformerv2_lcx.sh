@@ -13,7 +13,7 @@ exp_name=cdccav2/debug
 echo "exp name: $exp_name"
 mkdir -p /home/cx/ckpts/TPAMI/"$exp_name"
 
-CUDA_VISIBLE_DEVICES=5 torchrun --master_port=1112 --nproc_per_node=1 /home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/main_finetune_CDCCA.py \
+CUDA_VISIBLE_DEVICES=6 torchrun --master_port=1112 --nproc_per_node=1 /home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/main_finetune_CDCCA.py \
 --output_dir /home/cx/ckpts/TPAMI/"$exp_name" --epochs 3 --warmup_epochs 0.2 \
 --batch_size 1 --accum_iter 1 --num_workers 4 \
 --max_words 512 \

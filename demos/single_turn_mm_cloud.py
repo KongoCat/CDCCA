@@ -24,6 +24,7 @@ from scipy import signal
 from tqdm import tqdm
 import json
 from pt_transporter import PTReceiver
+import yaml
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Single-turn (conversation) demo', add_help=False)
@@ -151,14 +152,14 @@ with open(output_json_path, "w") as f:  #pseudo label
     json.dump(structured_samples, f, indent=2)
     
 # 读取原始 YAML 文件
-with open("/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/data/finetune/mm/alpaca_llava cdcca.yaml", "r") as f:
+with open("/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/data/finetune/mm/alpaca_llava_cdcca.yaml", "r") as f:
     config = yaml.safe_load(f)
 
 # 修改 path 字段
 config["META"][0]["path"] = output_json_path
 
 # 保存回 YAML 文件（覆盖或另存）
-with open("/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/data/finetune/mm/alpaca_llava cdcca.yaml", "w") as f:
+with open("/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/data/finetune/mm/alpaca_llava_cdcca.yaml", "w") as f:
     yaml.dump(config, f, sort_keys=False)
 
 print(f"Updated META[0].path to: {output_json_path}")
