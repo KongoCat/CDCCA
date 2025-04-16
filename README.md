@@ -1,7 +1,7 @@
 
 # 📡 Cloud-Edge Collaborative Inference with LLaMA Accessory
 
-This repository provides a complete tutorial and implementation for **cloud-edge collaborative large model inference**, based on [LLaMA-Accessory]([https://github.com/Alpha-VLLM/LLaMA2-Accessory]), with support for token-level uncertainty-driven transmission and  knowledge update between edge (7B) and cloud (13B) models.
+This repository provides a complete tutorial and implementation for **cloud-edge collaborative large model inference**, based on [LLaMA-Accessory](https://github.com/Alpha-VLLM/LLaMA2-Accessory), with support for token-level uncertainty-driven transmission and  knowledge update between edge (7B) and cloud (13B) models.
 
 ---
 
