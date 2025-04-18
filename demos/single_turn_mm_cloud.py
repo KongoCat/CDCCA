@@ -68,7 +68,7 @@ args = get_args_parser().parse_args()
 misc.init_distributed_mode(args)
 fs_init.initialize_model_parallel(args.model_parallel_size)
 
-receiver = PTReceiver(listen_ip='0.0.0.0', port=8010)
+receiver = PTReceiver(listen_ip='0.0.0.0', port=7010)
 if dist.get_rank() == 0:
     data = receiver.receive()
     obj_list = [data]
