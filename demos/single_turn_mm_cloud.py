@@ -26,6 +26,8 @@ import json
 from pt_transporter import PTReceiver
 import yaml
 
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Single-turn (conversation) demo', add_help=False)
     # Model parameters
@@ -57,11 +59,28 @@ def get_args_parser():
     parser.add_argument('--quant', action='store_true', help="enable quantization")
     return parser
 
+
+
+
 args = get_args_parser().parse_args()
 
 # define the model
 misc.init_distributed_mode(args)
 fs_init.initialize_model_parallel(args.model_parallel_size)
+
+receiver = PTReceiver(listen_ip='0.0.0.0', port=8010)
+if dist.get_rank() == 0:
+    data = receiver.receive()
+    obj_list = [data]
+    dist.broadcast_object_list(obj_list, src=0)
+else:
+    print(f"[Rank {dist.get_rank()}] Waiting for rank 0...")
+    obj_list = [None]
+    dist.broadcast_object_list(obj_list, src=0)
+    data = obj_list[0]
+    print(f"[Rank {rank}] Received data from rank 0!")
+
+
 target_dtype = {
     "bf16": torch.bfloat16,
     "fp16": torch.float16,
@@ -119,8 +138,6 @@ def generate(
     text_output = results[0].strip()
     return text_output
 
-receiver = PTReceiver(listen_ip='0.0.0.0', port=7007)
-data = receiver.receive()
 
 structured_samples = []
 save_dir = "/home/cx/llama2_accessory/someCode/debug"
