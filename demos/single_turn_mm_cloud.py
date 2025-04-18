@@ -147,6 +147,8 @@ os.makedirs(save_dir, exist_ok=True)
 for i,sample in enumerate(data):
     question = sample["question"]
     token_tensor = sample["token_tensor"]
+    local_rank = torch.cuda.current_device()
+    token_tensor = token_tensor.to(f"cuda:{local_rank}")
     ans = generate(token_tensor, question, "","alpaca",128,0.1,.75)
     # 保存 token_tensor 为单独的 .pt 文件
     tensor_path = os.path.join(save_dir, f"token_tensor_{i:05d}.pt")
