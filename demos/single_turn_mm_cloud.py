@@ -78,7 +78,7 @@ else:
     obj_list = [None]
     dist.broadcast_object_list(obj_list, src=0)
     data = obj_list[0]
-    print(f"[Rank {rank}] Received data from rank 0!")
+    print(f"[Rank {dist.get_rank()}] Received data from rank 0!")
 
 
 target_dtype = {
