@@ -39,7 +39,7 @@ from torch.utils.data import Dataset
 from data.alpaca_cdcca import FinetuneDataset, transform_train, FinetuneDistSampler
 from data.conversation.dataset import FinetuneDialogDataset
 
-from util.tensor_parallel import load_tensor_parallel_model
+from util.tensor_parallel import load_tensor_parallel_model, load_tensor_parallel_model_list
 
 
 def get_args_parser():
@@ -62,8 +62,10 @@ def get_args_parser():
                         help='path to tokenizer.model')
 
 
-    parser.add_argument('--pretrained_path', default='/path/to/pretrained', type=str,
-                        help='path to checkpoint from pretrain stage')
+    parser.add_argument('--pretrained_path', default='', type=str,
+                        help='path to checkpoint from pretrain stage (lora)')
+    parser.add_argument('--pretrained_base', default='/path/to/pretrained', type=str,
+                        help='path to checkpoint from pretrain stage (base)')
     parser.add_argument('--pretrained_type', type=str, choices=['consolidated', 'meta_ori'],
                         help='pretrained checkpoint save format')
 
@@ -179,7 +181,8 @@ def main(args):
 
                 # load pre-trained weights
                 print(f"## Load pretrained from {args.pretrained_path}", force=True)
-                load_tensor_parallel_model(model, args.pretrained_path, args.pretrained_type)
+                # load_tensor_parallel_model(model, args.pretrained_path, args.pretrained_type)
+                load_tensor_parallel_model_list(model, [args.pretrained_base] + [args.pretrained_path])
 
                 print("## Quantizing model to 4bit!", force=True)
                 quantization_config = BitsAndBytesConfig.from_dict(
@@ -204,7 +207,8 @@ def main(args):
         promote_trainable_params_to_fp32(model)
         misc.print_param_status(model)
         print(f"load pretrained from {args.pretrained_path}")
-        load_tensor_parallel_model(model, args.pretrained_path, args.pretrained_type)
+        # load_tensor_parallel_model(model, args.pretrained_path, args.pretrained_type)
+        load_tensor_parallel_model_list(model, [args.pretrained_base] + [args.pretrained_path])
     print("Unwrapped Model = %s" % str(model))
 
     # resume stage1
