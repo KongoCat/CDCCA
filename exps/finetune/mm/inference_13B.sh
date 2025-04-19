@@ -1,5 +1,5 @@
 #!/bin/bash
-PRETRAINED=/home/cx/ckpts/TPAMI/common/llama2_qformer_13B_vqav2/epoch0-iter59999
+PRETRAINED=/path_to_save_lora/epoch0-iter59999
 PRETRAINED_BASE=/home/cx/ckpts/llama2_acc/alpacaLlava_llamaQformerv2Peft_13b
 LLAMA_CONFIG="/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/13B_params.json"
 TOKENIZER=/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/tokenizer.model
