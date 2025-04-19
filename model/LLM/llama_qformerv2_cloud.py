@@ -346,8 +346,8 @@ class Transformer(nn.Module):
             self.teacher_model = MetaModel(self.teacher_llama_type, [self.teacher_config_path], self.teacher_tokenizer_path, with_visual=True)
 
         print("[TeacherLoader] Loading checkpoint from:", self.teacher_lora)
-        load_tensor_parallel_model_list(self.teacher_model, [self.teacher_base])
-        load_tensor_parallel_model_list(self.teacher_model, [self.teacher_lora])
+        load_tensor_parallel_model_list(self.teacher_model, [self.teacher_base] + [self.teacher_lora])
+        # load_tensor_parallel_model_list(self.teacher_model, [self.teacher_lora])
         print("[TeacherLoader] Teacher model loaded.")
 
         self.teacher_freqs_cis = precompute_freqs_cis(
