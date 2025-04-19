@@ -314,10 +314,10 @@ class Transformer(nn.Module):
         self.QueryKD_feature_proj = QueryKD(stu_channel=4096, tea_channel=5120) #7B 4096 13B 5120
         #--------------------------------------------------------
         # 在 __init__ 中设置教师模型路径等参数
-        self.teacher_base = "/home/cx/ckpts/llama2_acc/alpacaLlava_llamaQformerv2Peft_13b"
-        self.teacher_lora = "/home/cx/llama2_accessory/LLaMA2-Accessory-main/output/common/llama2_qformer_13B_aokvqa/epoch2"
-        self.teacher_tokenizer_path = "/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/tokenizer.model"
-        self.teacher_config_path = "/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/13B_params.json"
+        self.teacher_base = "/path_to_your_cloud_pretrained_base/alpacaLlava_llamaQformerv2Peft_13b"
+        self.teacher_lora = "/path_to_your_cloud_pretrained_lora/llama2_qformer_13B_vqav2/epoch0-iter59999"
+        self.teacher_tokenizer_path = "/path_to_your_accessory/configs/tokenizer.model"
+        self.teacher_config_path = "/path_to_your_accessory/configs/13B_params.json"
         self.teacher_llama_type = "llama_qformerv2_peft"
         #------------------------------------------------------------
         
