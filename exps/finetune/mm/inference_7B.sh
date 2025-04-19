@@ -1,6 +1,6 @@
 #!/bin/bash
 PRETRAINED=/path_to_save_lora/epoch0
-PRETRAINED_BASE=/home/cx/ckpts/llama2_acc/alpacaLlava_llamaQformerv2
+PRETRAINED_BASE=/path_to_save/alpacaLlava_llamaQformerv2
 LLAMA_CONFIG="/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/7B_params.json"
 TOKENIZER=/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/tokenizer.model
 
