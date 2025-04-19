@@ -25,7 +25,7 @@ pip install pytorch_wavelets
 Run the cloud-side script to launch the LLaMA-13B model in inference mode and **wait for incoming uncertainty token from the edge device**:
 
 ```bash
-bash exps/finetune/mm/inference_13B.sh
+sh /your/path/to/exps/finetune/mm/inference_13B.sh
 ```
 
 This will:
@@ -44,7 +44,7 @@ Run the edge-side script to:
 - Send selected tokens to the cloud over uplink
 
 ```bash
-bash exps/finetune/mm/inference_7B.sh
+sh /your/path/to/exps/finetune/mm/inference_7B.sh
 ```
 
 This reduces bandwidth usage by only transmitting informative tokens while preserving performance.
@@ -59,14 +59,14 @@ After receiving the uncertainty tokens, run the collaborative update script on t
 - Compute and transmit updated parameters to the edge device
 
 ```bash
-bash exps/finetune/mm/update_collab.sh
+sh /your/path/to/exps/finetune/mm/update_collab.sh
 ```
 
 ---
 
 ## 🚀 Features
 
-- ✅ Uncertainty-guided token transmission (MC Dropout / entropy filtering)
+- ✅ Uncertainty-guided token transmission (UTS-1 & UTS-2)
 - ✅ Plug-and-play compatibility with LLaMA 7B/13B
 - ✅ Socket-based edge-cloud communication (via `pt_transporter.py`)
 - ✅ Support for token fusion and DWC-based downlink update
