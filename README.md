@@ -22,7 +22,7 @@ pip install pytorch_wavelets
 
 ## 🖥️ 2. Launch Cloud-Side Listener
 
-Run the cloud-side script to launch the LLaMA-13B model in inference mode and **wait for incoming uncertainty token from the edge**:
+Run the cloud-side script to launch the LLaMA-13B model in inference mode and **wait for incoming uncertainty token from the edge device**:
 
 ```bash
 bash exps/finetune/mm/inference_13B.sh
@@ -30,12 +30,12 @@ bash exps/finetune/mm/inference_13B.sh
 
 This will:
 - Load the 13B model and initialize the socket server
-- Wait for uncertainty tokens from the edge-side model
+- Wait for uncertainty tokens from the device-side model
 - Prepare for collaborative distillation
 
 ---
 
-## 📱 3. Run Edge-Side Inference and Token Uplink
+## 📱 3. Run Device(edge)-Side Inference and Token Uplink
 
 Run the edge-side script to:
 - Load the LLaMA-7B lightweight model
@@ -51,12 +51,12 @@ This reduces bandwidth usage by only transmitting informative tokens while prese
 
 ---
 
-## 🔄 4. Cloud-Edge Collaborative Update
+## 🔄 4. Cloud-Device(Edge) Collaborative Update
 
 After receiving the uncertainty tokens, run the collaborative update script on the cloud to:
-- Fuse cloud and edge outputs
-- Apply token-level distillation to update both models
-- Compute and transmit updated parameters to the edge
+- Fuse cloud and device outputs
+- Apply token-level distillation to update models
+- Compute and transmit updated parameters to the edge device
 
 ```bash
 bash exps/finetune/mm/update_collab.sh
