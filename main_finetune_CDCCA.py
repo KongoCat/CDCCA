@@ -1,347 +1,494 @@
-import argparse
-import datetime
-import json
-import numpy as np
-import os
-import time
-from pathlib import Path
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
+
+from typing import Optional, Tuple, Union
+from dataclasses import dataclass
+import math
 import functools
-from functools import partial
-
+import os
 import torch
-import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    ShardingStrategy,
-    CPUOffload
+from torch import nn
+import torch.nn.functional as F
+import json
+import fairscale.nn.model_parallel.initialize as fs_init
+from fairscale.nn.model_parallel.layers import (
+    ParallelEmbedding,
+    RowParallelLinear,
+    ColumnParallelLinear
 )
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper,
-    CheckpointImpl,
-    apply_activation_checkpointing,
-)
-from torch.distributed.fsdp.wrap import (
-    transformer_auto_wrap_policy,
-)
+from ..peft import LoraColumnParallelLinear, LoraRowParallelLinear
+import re
+from apex.normalization import FusedRMSNorm as RMSNorm
+from transformers import Blip2Processor, Blip2Model
 
-from fairscale.nn.model_parallel import initialize as fs_init
+from ..tokenizer import Tokenizer
+import configs.global_configs
+if configs.global_configs.USE_FLASH_ATTENTION:
+    from flash_attn import flash_attn_func
 
-from apex.optimizers import FusedAdam
+default_linear_init = functools.partial(nn.init.kaiming_uniform_, a=math.sqrt(5))
 
-import util.misc as misc
-from util.misc import NativeScalerWithGradNormCount as NativeScaler
-from util.tensor_type import default_tensor_type, promote_trainable_params_to_fp32
-from model.meta_cloud import MetaModel
-from engine_finetune_cdcca import train_one_epoch
-from torch.utils.data import Dataset
-from data.alpaca_cdcca import FinetuneDataset, transform_train, FinetuneDistSampler
-from data.conversation.dataset import FinetuneDialogDataset
-
-from util.tensor_parallel import load_tensor_parallel_model, load_tensor_parallel_model_list
+from .llama import precompute_freqs_cis, reshape_for_broadcast, apply_rotary_emb, repeat_kv
+import copy
+from .distill_loss import FKD, SKD, QueryKD
+from . import llama_qformerv2_peft
+from .. import LLM
+from util.tensor_parallel import load_tensor_parallel_model_list
+from util.tensor_type import default_tensor_type
 
 
-def get_args_parser():
-    parser = argparse.ArgumentParser('LLaMA2-Accessory Finetuning', add_help=False)
-    parser.add_argument('--batch_size', default=16, type=int,
-                        help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--accum_iter', default=4, type=int,
-                        help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
-    # Model parameters
-    parser.add_argument('--llama_type', default='llama', type=str, metavar='MODEL',
-                        help='Name of model to train')
-    parser.add_argument('--llama_config', default=['params.json'], nargs="+",
-                        help='Path to llama model config. If multiple jsons are given, their union will be used. '
-                             'When the same key appears more than once, its last appearance is adopted.')
+@dataclass
+class ModelArgs:
+    dim: int = 4096
+    n_layers: int = 32
+    n_heads: int = 32
+    n_kv_heads: Optional[int] = None
+    vocab_size: int = -1  # defined later by tokenizer
+    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
+    ffn_dim_multiplier: Optional[float] = None
+    norm_eps: float = 1e-5
+    rope_theta: float = 10000
 
-    parser.add_argument('--no_visual', action="store_true",
-                        help='to not instantialize visual modules')
-    parser.add_argument('--tokenizer_path', type=str, default="../tokenizer.model",
-                        help='path to tokenizer.model')
+    max_batch_size: int = 8
+    max_seq_len: int = 512
 
+    rope_scaling: Optional[float] = None
 
-    parser.add_argument('--pretrained_path', default='', type=str,
-                        help='path to checkpoint from pretrain stage (lora)')
-    parser.add_argument('--pretrained_base', default='/path/to/pretrained', type=str,
-                        help='path to checkpoint from pretrain stage (base)')
-    parser.add_argument('--pretrained_type', type=str, choices=['consolidated', 'meta_ori'],
-                        help='pretrained checkpoint save format')
+    lora_rank: int = -1 # lora
 
-    # Optimizer parameters
-    parser.add_argument('--weight_decay', type=float, default=0.02,
-                        help='weight decay (default: 0.02)')
-
-    parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
-                        help='learning rate (absolute lr)')
-    parser.add_argument('--min_lr', type=float, default=0.0001, metavar='LR',
-                        help='lower lr bound for cyclic schedulers that hit 0')
-
-    parser.add_argument('--epochs', default=400, type=int)
-    parser.add_argument('--warmup_epochs', type=float, default=1.0, metavar='N',
-                        help='epoch to warmup LR')
-
-    parser.add_argument('--clip_grad', type=int, default=-1,
-                        help='grad clipping norm')
-
-    # Dataset parameters
-    parser.add_argument('--max_words', default=1024, type=int,
-                        help='max token length')
-    parser.add_argument('--dialog', action="store_true", default=False,
-                        help='whether use dialog dataset')
-    parser.add_argument('--data_config', default='/path/to/data/config/yaml', type=str,
-                        help='data config path')
-
-    parser.add_argument('--output_dir', default='./output_dir',
-                        help='path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default='./output_dir',
-                        help='path where to tensorboard log')
-    parser.add_argument('--save_interval', default=1, type=int,
-                        help='number of epochs between model saving')
-    parser.add_argument('--only_save_trainable', default=False, action="store_true",
-                        help='only save trainable model parameters')
-    parser.add_argument('--device', default='cuda',
-                        help='device to use for training / testing')
-    parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--resume', default='',
-                        help='resume from checkpoint')
-
-    parser.add_argument('--num_workers', default=5, type=int)
-    parser.add_argument('--pin_mem', action='store_true',
-                        help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
-    parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
-    parser.set_defaults(pin_mem=True)
-
-    # distributed training parameters
-    parser.add_argument('--world_size', default=1, type=int,
-                        help='number of distributed processes')
-    parser.add_argument('--local_rank', default=-1, type=int)
-    parser.add_argument('--dist_on_itp', action='store_true')
-    parser.add_argument('--dist_url', default='env://',
-                        help='url used to set up distributed training')
-
-    parser.add_argument('--model_parallel_size', type=int, default=1)
-    parser.add_argument('--data_parallel', type=str, choices=['sdp', 'fsdp'], default='sdp')
-    parser.add_argument('--precision', type=str, choices=['fp16', 'bf16', 'tf32'], default='bf16')
-    parser.add_argument('--checkpointing', action="store_true", default=False,
-                        help="enable gradient checkopointing")
-    parser.add_argument('--quant', action="store_true", default=False,
-                        help="enable quantization to speedup and save memory")
-
-    return parser
+    bias_tuning: bool = True  # bias
 
 
-def main(args):
-    misc.init_distributed_mode(args)
-    fs_init.initialize_model_parallel(args.model_parallel_size)
-    if args.precision == "tf32":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+class Attention(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.n_heads
 
-    print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
-    print("{}".format(args).replace(', ', ',\n'))
-
-    device = torch.device(args.device)
-
-    # fix the seed for reproducibility
-    seed = args.seed + misc.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    cudnn.benchmark = True
-
-    global_rank = misc.get_rank()
-    mp_rank = fs_init.get_model_parallel_rank()
-    dp_rank = fs_init.get_data_parallel_rank()
-    dp_world_size = fs_init.get_data_parallel_world_size()
-    dp_group = fs_init.get_data_parallel_group()
-
-    # define the model
-    mixed_precision_dtype = {
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-        "tf32": torch.float32,
-    }[args.precision]
-    print("Start initialization.")
-
-    if args.quant:
-        from util.quant import quantize
-        from transformers.utils.quantization_config import BitsAndBytesConfig
-        assert args.only_save_trainable, "only_save_trainable must be True when quantization is in the loop."
-        for i in range(misc.get_world_size()):
-            if i == misc.get_rank():
-                print(f"## Processing on RANK {i}.", force=True)
-                with default_tensor_type(dtype=mixed_precision_dtype, device="cpu"):
-                    model = MetaModel(args.llama_type, args.llama_config,
-                                    args.tokenizer_path, with_visual=not args.no_visual,
-                                    max_seq_len=args.max_words)
-                promote_trainable_params_to_fp32(model)
-                misc.print_param_status(model)
-
-                # load pre-trained weights
-                print(f"## Load pretrained from {args.pretrained_path}", force=True)
-                # load_tensor_parallel_model(model, args.pretrained_path, args.pretrained_type)
-                load_tensor_parallel_model_list(model, [args.pretrained_base] + [args.pretrained_path])
-
-                print("## Quantizing model to 4bit!", force=True)
-                quantization_config = BitsAndBytesConfig.from_dict(
-                    config_dict={
-                        "load_in_8bit": False, 
-                        "load_in_4bit": True, 
-                        "bnb_4bit_quant_type": "nf4",
-                    },
-                    return_unused_kwargs=False,
-                )
-                quantize(model, quantization_config)
-                
-                # will (1) release CPU memory usage, and (2) occupy GPU memory.
-                model.cuda() 
-            torch.distributed.barrier()
-    else:
-        with default_tensor_type(dtype=mixed_precision_dtype, device="cuda"):
-            model = MetaModel(args.llama_type, args.llama_config,
-                            args.tokenizer_path, with_visual=not args.no_visual,
-                            max_seq_len=args.max_words)
-        print("Finish initialization.")
-        promote_trainable_params_to_fp32(model)
-        misc.print_param_status(model)
-        print(f"load pretrained from {args.pretrained_path}")
-        # load_tensor_parallel_model(model, args.pretrained_path, args.pretrained_type)
-        load_tensor_parallel_model_list(model, [args.pretrained_base] + [args.pretrained_path])
-    print("Unwrapped Model = %s" % str(model))
-
-    # resume stage1
-    if args.resume:
-        misc.resume_stage1(args, model_without_FSDP=model)
-
-    TransformerBlock = type(model.llma.layers[0])
-    # ignored_named_parameters = {name: param for name, param in model.named_parameters() if not param.requires_grad}
-    # print(ignored_named_parameters.keys())
-    
-    model = model.to(torch.bfloat16)
-    model = FSDP(
-        model,
-        process_group=fs_init.get_data_parallel_group(),
-        auto_wrap_policy=functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls=[] if model.is_peft else [TransformerBlock],
-        ),
-        limit_all_gathers=True,
-        use_orig_params=True,
-        sync_module_states=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=mixed_precision_dtype,
-            reduce_dtype=mixed_precision_dtype,
-            buffer_dtype=mixed_precision_dtype,
-        ),
-        sharding_strategy={
-            "sdp": ShardingStrategy.SHARD_GRAD_OP,
-            "ddp": ShardingStrategy.NO_SHARD,
-            "fsdp": ShardingStrategy.FULL_SHARD,
-        }[args.data_parallel],
-        device_id=device,
-        # ignored_parameters=[param for param in model.parameters() if not param.requires_grad]
-    )
-
-    # broadcast nonmp parameters within model parallel group
-    misc.broadcast_nonmp_parameters(model)
-
-    # gradient checkpointing
-    if args.checkpointing:
-        print("apply gradient checkpointing")
-        non_reentrant_wrapper = partial(
-            checkpoint_wrapper,
-            # offload_to_cpu=False,
-            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        self.wq = LoraColumnParallelLinear(
+            args.dim,
+            args.n_heads * self.head_dim,
+            bias=args.bias_tuning,
+            gather_output=False,
+            init_method=default_linear_init,
+            lora_rank=args.lora_rank
         )
-        check_fn = lambda submodule: isinstance(submodule, TransformerBlock)
-        apply_activation_checkpointing(model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
+        self.wk = LoraColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=args.bias_tuning,
+            gather_output=False,
+            init_method=default_linear_init,
+            lora_rank=args.lora_rank
+        )
+        self.wv = LoraColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=args.bias_tuning,
+            gather_output=False,
+            init_method=default_linear_init,
+            lora_rank=args.lora_rank
+        )
+        self.wo = LoraRowParallelLinear(
+            args.n_heads * self.head_dim,
+            args.dim,
+            bias=args.bias_tuning,
+            input_is_parallel=True,
+            init_method=default_linear_init,
+            lora_rank=args.lora_rank
+        )
 
-    # print("Model = %s" % str(model))
+        self.args = args
 
-    eff_batch_size = args.batch_size * args.accum_iter * fs_init.get_data_parallel_world_size()
-    print("effective batch size: %d" % eff_batch_size)
+        self.flash = configs.global_configs.USE_FLASH_ATTENTION
+        self.k_cache, self.v_cache = None, None
 
-    # following timm: set wd as 0 for bias and norm layers
-    param_groups = misc.add_weight_decay(model, args.weight_decay)
-    optimizer = FusedAdam(param_groups, lr=args.lr, betas=(0.9, 0.95))
-    # print(optimizer)
-    loss_scaler = NativeScaler(args)
+    def forward(
+        self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor,
+        mask: Union[torch.Tensor, str, None]
+    ) -> torch.Tensor:
+        """
+        Supported mask spec:
+        1. Float tensor: The tensor is added to the attention score matrix.
+        2. Boolean tensor: Substitute the ``True`` values with ``0.0`` and ``False`` values with
+           ``-inf``, then process in the same way as the float tensor.
+        3. str: Currently the only supported choice is ``causal``, for which each token attends
+           to all tokens appearing no later than itself. Our implementation assumes the query and
+           key sequences aligns on the right for ``causal`` if their lengths are not equal.
+        """
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-    # data
-    if args.dialog:
-        DatasetClass = FinetuneDialogDataset
-    else:
-        DatasetClass = FinetuneDataset
-    dataset_train = DatasetClass(args.data_config, transform_train,
-                                 max_words=args.max_words, image_words=model.get_image_words(),
-                                 tokenizer_path=args.tokenizer_path)
-    # print(dataset_train)
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-    if global_rank == 0 and args.log_dir is not None:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
-    else:
-        log_writer = None
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-    sampler_train = FinetuneDistSampler(
-        dataset_train, num_replicas=dp_world_size, rank=dp_rank, shuffle=True, batch_size=args.batch_size,
-        acc_grad=args.accum_iter
-    )
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        sampler=sampler_train,
-        drop_last=True,
-    )
+        # if cache is enabled, prepend keys and values in the history.
+        if self.k_cache is None or self.v_cache is None:
+            keys, values = xk, xv
+        else:
+            self.k_cache = self.k_cache.to(xk)
+            self.v_cache = self.v_cache.to(xv)
+            self.k_cache[:bsz, start_pos: start_pos + seqlen, :, :] = xk
+            self.v_cache[:bsz, start_pos: start_pos + seqlen, :, :] = xv
+            keys = self.k_cache[:bsz, :start_pos + seqlen]
+            values = self.v_cache[:bsz, :start_pos + seqlen]
 
-    start_epoch = 0
-    if args.resume:
-        start_epoch, _ = misc.resume_stage2(args=args, model=model, optimizer=optimizer, loss_scaler=loss_scaler,
-                                            dataset_train=dataset_train)
+        is_causal = isinstance(mask, str) and mask == "causal"
+        # "causal" dispatches to flash_attn only when q and k have the same seqlen
+        # because currently the flash_attn causal impl for unequal q & k length is not suited
+        # for generation: Generation with cache requires aligning on the right, while the
+        # current flash_attn impl aligns on the left. For example, we expect the mask to be
+        # as the left one, while the current flash_attn impl gives the right one
+        #
+        #              K                     K
+        #        1 1 1 1 1 0 0         1 0 0 0 0 0 0
+        #     Q  1 1 1 1 1 1 0       Q 1 1 0 0 0 0 0
+        #        1 1 1 1 1 1 1         1 1 1 0 0 0 0
+        use_flash = (
+            self.flash  # user configuration
+            and (mask is None or (is_causal and keys.size(1) == xq.size(1)))  # supported mask
+        )
+        if use_flash:
+            # repeating k/v heads is included in flash_attn
+            output = flash_attn_func(xq, keys, values, dropout_p=0.0, causal=is_causal)
+            output = output.contiguous().view(bsz, seqlen, -1)
+        else:
+            # repeat k/v heads if n_kv_heads < n_heads
+            keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+            values = repeat_kv(values, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+
+            xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+            keys = keys.transpose(1, 2)
+            values = values.transpose(1, 2)
+            if isinstance(mask, str):
+                if is_causal:
+                    mask = self._make_causal_mask(xq.size(2), keys.size(2))
+                    mask = mask.to(xq.device, non_blocking=True)
+                else:
+                    raise NotImplementedError()
+            output = F.scaled_dot_product_attention(xq, keys, values, dropout_p=0.0, attn_mask=mask)
+            output = output.transpose(
+                1, 2
+            ).contiguous().view(bsz, seqlen, -1)
+
+        return self.wo(output)
+
+    def allocate_kv_cache(self, max_batch_size: int, max_seq_len: int) -> None:
+        kv_cache_shape = (max_batch_size, max_seq_len, self.n_local_kv_heads, self.head_dim)
+        if self.k_cache is None or self.k_cache.size() != kv_cache_shape:
+            self.k_cache = torch.empty(kv_cache_shape)
+        if self.v_cache is None or self.v_cache.size() != kv_cache_shape:
+            self.v_cache = torch.empty(kv_cache_shape)
+
+    def destroy_kv_cache(self) -> None:
+        self.k_cache, self.v_cache = None, None
+
+    def _make_causal_mask(self, q_len: int, kv_len: int) -> torch.Tensor:
+        q_indices = torch.arange(q_len) - q_len
+        kv_indices = torch.arange(kv_len) - kv_len
+        causal_mask_bool = q_indices.view(-1, 1) >= kv_indices.view(1, -1)
+        return causal_mask_bool
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float],
+        args: ModelArgs,
+    ):
+        super().__init__()
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        self.w1 = LoraColumnParallelLinear(
+            dim, hidden_dim, bias=args.bias_tuning, gather_output=False,
+            init_method=default_linear_init, lora_rank=args.lora_rank
+        )
+        self.w2 = LoraRowParallelLinear(
+            hidden_dim, dim, bias=args.bias_tuning, input_is_parallel=True,
+            init_method=default_linear_init, lora_rank=args.lora_rank
+        )
+        self.w3 = LoraColumnParallelLinear(
+            dim, hidden_dim, bias=args.bias_tuning, gather_output=False,
+            init_method=default_linear_init, lora_rank=args.lora_rank
+        )
+
+    # @torch.compile
+    def _silu_gating(self, x, y):
+        return F.silu(x) * y
+
+    def forward(self, x):
+        return self.w2(self._silu_gating(self.w1(x), self.w3(x)))
 
 
-    print(f"Start training for {args.epochs} epochs")
-    start_time = time.time()
-    for epoch in range(start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
-
-        train_stats = train_one_epoch(
-            model, data_loader_train,
-            optimizer, epoch, loss_scaler,
-            log_writer=log_writer,
+class TransformerBlock(nn.Module):
+    def __init__(self, layer_id: int, args: ModelArgs):
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        self.attention = Attention(args)
+        self.feed_forward = FeedForward(
+            dim=args.dim,
+            hidden_dim=4 * args.dim,
+            multiple_of=args.multiple_of,
+            ffn_dim_multiplier=args.ffn_dim_multiplier,
             args=args
         )
+        self.layer_id = layer_id
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-        if args.output_dir and (epoch % args.save_interval == 0 or epoch + 1 == args.epochs):
-            misc.save_checkpoint(
-                output_dir=args.output_dir,
-                args=args, epoch=epoch, iteration=None, model=model, optimizer=optimizer,
-                loss_scaler=loss_scaler, dataset_state=None,
+    def _forward_ffn(self, h):
+        return h + self.feed_forward(self.ffn_norm(h))
+
+    def _forward_attention(self, x, start_pos, freqs_cis, mask):
+        return x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+
+    def forward(
+        self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor,
+        mask: Union[torch.Tensor, str, None]
+    ) -> torch.Tensor:
+        h = self._forward_attention(x, start_pos, freqs_cis, mask)
+        out = self._forward_ffn(h)
+        return out
+
+# def load_model(model_without_ddp, path):
+#     if path.startswith('https'):
+#         checkpoint = torch.hub.load_state_dict_from_url(
+#             path, map_location='cpu', check_hash=True)
+#     else:
+#         checkpoint = torch.load(path, map_location='cpu')
+#     new_checkpoint = {}
+#     for key, value in checkpoint['model'].items():
+#         # # key = key.replace("llma", "llama")
+#         key =  key.removeprefix("llma.")
+#         new_checkpoint[key] = value
+
+#     print(model_without_ddp.load_state_dict(new_checkpoint, strict=False))
+#     print("Load checkpoint %s" % path)
+
+class Transformer(nn.Module):
+    is_peft = True
+    def __init__(self, params: ModelArgs, with_visual=False):
+        super().__init__()
+        self.params = params
+        self.vocab_size = params.vocab_size
+        self.n_layers = params.n_layers
+        self.tok_embeddings = ParallelEmbedding(
+            params.vocab_size, params.dim, init_method=default_linear_init
+        )
+
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(params.n_layers):
+            self.layers.append(TransformerBlock(layer_id, params))
+
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        self.output = ColumnParallelLinear(
+            params.dim, params.vocab_size, bias=False, init_method=default_linear_init
+        )
+
+        self.freqs_cis = precompute_freqs_cis(
+            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2,
+            theta=self.params.rope_theta, scaling=self.params.rope_scaling
+        )
+
+        self.image_words = 0
+        self.cache_image_words = 0 # for inference
+        
+        #--------------------------------Query KD------------------------------------------------------------------------------------------
+        self.QueryKD = QueryKD(stu_channel=4096, tea_channel=5120)
+        self.QueryKD_feature_proj = QueryKD(stu_channel=4096, tea_channel=5120) #7B 4096 13B 5120
+        #--------------------------------------------------------
+        # 在 __init__ 中设置教师模型路径等参数
+        self.teacher_base = "/home/cx/ckpts/llama2_acc/alpacaLlava_llamaQformerv2Peft_13b"
+        self.teacher_lora = "/home/cx/ckpts/TPAMI/common/llama2_qformer_13B_vqav2/epoch0-iter59999"
+        self.teacher_tokenizer_path = "/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/tokenizer.model"
+        self.teacher_config_path = "/home/cx/llama2_accessory/LLaMA2-Accessory-main/accessory/configs/13B_params.json"
+        self.teacher_llama_type = "llama_qformerv2_peft"
+        #------------------------------------------------------------
+        
+        
+        if with_visual:
+            print("build llama model with qformerv2")
+            # self.qformer = Blip2Model.from_pretrained("/home/cx/ckpts/blip2-opt-2.7b", torch_dtype=torch.float16) #("Salesforce/blip2-opt-2.7b", torch_dtype=torch.float16)
+
+            # self.qformer.language_projection = None
+            # self.qformer.language_model = None
+
+            self.qformer_proj = nn.Sequential(
+                nn.Linear(768, params.dim),
+                nn.LayerNorm(params.dim)
             )
+            self.image_words = 32
+            # add image tags
+            self.start_img = nn.Parameter(torch.rand(1, 1, params.dim))
+            self.end_img = nn.Parameter(torch.rand(1, 1, params.dim))
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     'epoch': epoch,
-                     **{f'val_{k}': v for k, v in train_stats.items()}}
+    def get_teacher_model(self, device="cpu"):
+        from model.meta import MetaModel
+        
+        if getattr(self, "_teacher_model_loaded", False):
+            return self.teacher_model, self.teacher_freqs_cis
+        
+        with default_tensor_type(dtype=torch.bfloat16, device=device):
+            self.teacher_model = MetaModel(self.teacher_llama_type, [self.teacher_config_path], self.teacher_tokenizer_path, with_visual=True)
 
-        if args.output_dir and misc.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
+        print("[TeacherLoader] Loading checkpoint from:", self.teacher_lora)
+        load_tensor_parallel_model_list(self.teacher_model, [self.teacher_base] + [self.teacher_lora])
+        print("[TeacherLoader] Teacher model loaded.")
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+        self.teacher_freqs_cis = precompute_freqs_cis(
+            self.teacher_model.llma.params.dim // self.teacher_model.llma.params.n_heads,
+            self.teacher_model.llma.params.max_seq_len * 2,
+            theta=self.teacher_model.llma.params.rope_theta,
+            scaling=self.teacher_model.llma.params.rope_scaling
+        )
+
+        self._teacher_model_loaded = True
+        return self.teacher_model.llma, self.teacher_freqs_cis
 
 
-if __name__ == '__main__':
-    args = get_args_parser()
-    args = args.parse_args()
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    main(args)
+
+
+    def get_trainable_params(self):
+        trainable = {}
+        # p_list=[]
+      
+        for name, para in self.named_parameters():
+            # p_list.append(name)
+            if 'teacher' in name:
+                # print("SKIPPED")
+                continue    
+            if not name.startswith("qformer."):
+                trainable_key_words = ['norm', 'bias', 'lora', 'align_module']
+                if any([_ in name for _ in trainable_key_words]):
+                    trainable[name] = para
+            else:
+                trainable_key_words = ['qformer_proj', 'Query_KD']
+                if any([_ in name for _ in trainable_key_words]):
+                    trainable[name] = para
+
+        return trainable
+
+    # def encode_image(self, image):
+    #     # [B, 32, 768]
+    #     with torch.no_grad():
+    #         image_feats = self.qformer.get_qformer_features(pixel_values=image)
+    #     # image_feats = self.qformer_proj(image_feats.last_hidden_state)
+    #     return image_feats
+
+    def forward(self, examples, image=None):
+        self._destroy_kv_cache()  # training always disables kv cache
+        _bsz, seqlen = examples.shape
+        h = self.tok_embeddings(examples)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        
+        with torch.no_grad():
+            self.teacher_model, self.teacher_freqs_cis = self.get_teacher_model(device="cuda")  # or "cpu" if you want lazy .to(device)
+            h_teacher = self.teacher_model.tok_embeddings(examples)
+            self.teacher_freqs_cis = self.teacher_freqs_cis.to(h_teacher.device)
+
+        image_words = 0
+        if image is not None:
+            h_bos, h_caption = h[:, :1], h[:, 1:]
+            h_teacher_bos,h_teacher_caption = h_teacher[:, :1],h_teacher[:, 1:]
+            image_tokens = self.qformer_proj(image)
+            h = torch.cat((h_bos, self.start_img.expand(_bsz, -1, -1), image_tokens, self.end_img.expand(_bsz, -1, -1), h_caption), dim=1)
+            with torch.no_grad():
+                image_teacher_tokens = self.teacher_model.qformer_proj(copy.deepcopy(image))
+                h_teacher = torch.cat((h_teacher_bos, self.teacher_model.start_img.expand(_bsz, -1, -1), image_teacher_tokens, self.teacher_model.end_img.expand(_bsz, -1, -1), h_teacher_caption), dim=1)
+            image_words = image_tokens.shape[1] + 1 + 1
+            seqlen = h.shape[1]
+            seqlen_teacher = h_teacher.shape[1]
+            
+            
+        freqs_cis = self.freqs_cis[:seqlen]
+        teacher_freqs_cis = self.teacher_freqs_cis[:seqlen_teacher]
+        #-------------------------------------------------------
+        idx = 0
+        for layer in self.layers:
+            idx+=1
+            h = layer(h, start_pos=0, freqs_cis=freqs_cis, mask="causal")         
+        #-------------------------------------------------------
+        with torch.no_grad():
+            idx = 0
+            for layer in self.teacher_model.layers:
+            #  print(f"idx : {idx} , h_teacher shape is : {h_teacher.size()}")
+                idx+=1
+                h_teacher = layer(h_teacher, start_pos=0, freqs_cis=teacher_freqs_cis, mask="causal")  # Teacher h shape torch.Size([32, 115, 4096])
+        #-------------------------------------------------------
+        h = self.norm(h)
+        h_teacher = self.teacher_model.norm(h_teacher)
+        
+        KD_feature_loss = self.QueryKD_feature_proj(h,h_teacher.detach())
+        
+        output = self.output(h[:, image_words:, :])
+        
+        #----------calculate_KD loss----------------------------------------
+        f_s = image_tokens #get student token
+        f_t = image_teacher_tokens
+        
+        KD_token_loss = self.QueryKD(f_s,f_t)
+        
+        return output, KD_token_loss, KD_feature_loss
+
+
+    @torch.inference_mode()
+    def forward_inference(self, tokens: torch.Tensor, start_pos: int, uts_tokens:torch.Tensor):
+        _bsz, seqlen = tokens.shape
+        if start_pos == 0:
+            self._allocate_kv_cache(_bsz)  # kv cache will not re-allocate if size is unchanged
+        h = self.tok_embeddings(tokens)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+
+        if uts_tokens is not None:
+            assert start_pos == 0
+            h_bos, h_caption = h[:, :1], h[:, 1:]
+            image_tokens = self.qformer_proj(uts_tokens) #load UTS tokens
+            self.cache_image_words = image_tokens.shape[1] + 1 + 1
+            h = torch.cat((h_bos, self.start_img.repeat(_bsz, 1, 1), image_tokens, self.end_img.repeat(_bsz, 1, 1), h_caption), dim=1)
+            seqlen = h.shape[1]
+            freqs_cis = self.freqs_cis[0: seqlen]
+        else:
+            if start_pos == 0:
+                self.cache_image_words = 0
+                freqs_cis = self.freqs_cis[0: seqlen]
+            else:
+                # if image was not None when start_pos=0,
+                # the offset should be added to start_pos within later forward_inference calls
+                start_pos = start_pos + self.cache_image_words
+                freqs_cis = self.freqs_cis[start_pos: start_pos + seqlen]
+
+        # Despite that "causal" also works for seqlen == 1, keep it to None for possibly
+        # better performance
+        mask = None if seqlen == 1 else "causal"
+
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)
+        output = self.output(h[:, -1, :])  # only compute last logits
+        return output.float()
+
+    def _allocate_kv_cache(self, max_batch_size: int) -> None:
+        for layer in self.layers:
+            layer.attention.allocate_kv_cache(max_batch_size, self.params.max_seq_len)
+
+    def _destroy_kv_cache(self) -> None:
+        for layer in self.layers:
+            layer.attention.destroy_kv_cache()
+
+
