@@ -55,7 +55,7 @@ This reduces bandwidth usage by only transmitting informative tokens while prese
 
 After receiving the uncertainty tokens, run the collaborative update script on the cloud to:
 - Fuse cloud and device outputs
-- Apply token-level distillation to update models
+- Apply adapter-based knowledge distillation to update models
 - Compute and transmit updated parameters to the edge device
 
 ```bash
