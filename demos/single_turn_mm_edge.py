@@ -70,9 +70,9 @@ with default_tensor_type(dtype=target_dtype, device="cpu" if args.quant else "cu
     model = MetaModel(args.llama_type, args.llama_config, args.tokenizer_path, with_visual=True)
 #exit()
 print(f"load pretrained from {args.pretrained_path}")
-load_result = load_tensor_parallel_model_list(model, args.pretrained_path_base)
+load_result = load_tensor_parallel_model_list(model, args.pretrained_path_base + args.pretrained_path)
 # print("load result: ", load_result)
-load_result = load_tensor_parallel_model_list(model, args.pretrained_path)
+# load_result = load_tensor_parallel_model_list(model, args.pretrained_path)
 # print("load result: ", load_result)
 
 
